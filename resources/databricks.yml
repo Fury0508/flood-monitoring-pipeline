@@ -7,6 +7,11 @@
 bundle:
   name: flood-monitoring-pipeline
 
+sync:
+  paths:
+    - .
+    - ../notebooks
+
 variables:
   catalog:
     description: Unity Catalog catalog this target writes to.
