@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# Databricks
+.databricks/
+*.dbc
+
+# Local data: samples committed under data/samples are the exception
+data/*
+!data/samples/
+!data/samples/**
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+
+# Never commit credentials
+.env
+*.pem
+databricks.cfg
