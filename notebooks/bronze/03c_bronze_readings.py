@@ -15,7 +15,7 @@ dbutils.widgets.text("run_id", "", "Landing run id (blank = latest successful)")
 
 # COMMAND ----------
 
-# MAGIC %run ./00_bronze_common
+# MAGIC %run ../common/00_bronze_common
 
 # COMMAND ----------
 

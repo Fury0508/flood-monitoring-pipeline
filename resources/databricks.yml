@@ -100,7 +100,7 @@ resources:
           depends_on:
             - task_key: landing_stations
           notebook_task:
-            notebook_path: ../notebooks/03a_bronze_stations.py
+            notebook_path: ../notebooks/bronze/03a_bronze_stations.py
             base_parameters:
               catalog: "{{job.parameters.catalog}}"
               run_id: "{{job.parameters.run_id}}"
@@ -111,7 +111,7 @@ resources:
           depends_on:
             - task_key: landing_measures
           notebook_task:
-            notebook_path: ../notebooks/03b_bronze_measures.py
+            notebook_path: ../notebooks/bronze/03b_bronze_measures.py
             base_parameters:
               catalog: "{{job.parameters.catalog}}"
               run_id: "{{job.parameters.run_id}}"
@@ -122,7 +122,7 @@ resources:
           depends_on:
             - task_key: landing_readings
           notebook_task:
-            notebook_path: ../notebooks/03c_bronze_readings.py
+            notebook_path: ../notebooks/bronze/03c_bronze_readings.py
             base_parameters:
               catalog: "{{job.parameters.catalog}}"
               run_id: "{{job.parameters.run_id}}"
