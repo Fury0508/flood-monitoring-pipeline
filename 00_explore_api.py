@@ -147,20 +147,3 @@ print(f"Readings for {yesterday}: {len(items):,} in {elapsed:.0f}s")
 print(f"meta.limit: {day_json['meta'].get('limit')}")
 print(f"Items missing 'value' (NaN readings): {sum(1 for i in items if 'value' not in i):,}")
 print(f"Items where value is not a number: {sum(1 for i in items if 'value' in i and not isinstance(i['value'], (int, float))):,}")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Findings (fill in after running)
-# MAGIC
-# MAGIC | Question | Result |
-# MAGIC |---|---|
-# MAGIC | Number of stations / measures | |
-# MAGIC | Is the stations list truncated? | |
-# MAGIC | Archive CSV size per day | |
-# MAGIC | Rows per day / estimated 7 days | |
-# MAGIC | Non-numeric values found? | |
-# MAGIC | Duplicate (measure, dateTime) rows? | |
-# MAGIC | Busiest measure (readings/day) | |
-# MAGIC | Oldest reading available via API | |
-# MAGIC | One-day JSON pull: rows and seconds | |
