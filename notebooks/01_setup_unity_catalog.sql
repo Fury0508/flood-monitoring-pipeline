@@ -70,20 +70,28 @@ COMMENT 'Latest reading timestamp loaded per measure';
 
 -- MAGIC %md
 -- MAGIC ## Access control (RBAC)
--- MAGIC The three groups must exist first: **Settings → Identity and access → Groups**.
 -- MAGIC Least privilege: analysts see only Gold; data scientists also see Silver and own a sandbox.
+-- MAGIC
+-- MAGIC The grants below are left in place as documentation but are commented out.
+-- MAGIC Databricks Free Edition cannot create account groups, so `data_engineers`,
+-- MAGIC `data_analysts` and `data_scientists` do not exist and every GRANT fails with
+-- MAGIC a principal-not-found error. On a workspace where the groups can be created
+-- MAGIC (**Settings → Identity and access → Groups**), uncomment this cell and run it.
 
 -- COMMAND ----------
 
-GRANT ALL PRIVILEGES ON CATALOG flood_monitoring TO `data_engineers`;
+-- GRANT ALL PRIVILEGES ON CATALOG flood_monitoring TO `data_engineers`;
 
-GRANT USE CATALOG ON CATALOG flood_monitoring TO `data_analysts`;
-GRANT USE SCHEMA, SELECT ON SCHEMA flood_monitoring.gold TO `data_analysts`;
+-- GRANT USE CATALOG ON CATALOG flood_monitoring TO `data_analysts`;
+-- GRANT USE SCHEMA, SELECT ON SCHEMA flood_monitoring.gold TO `data_analysts`;
 
-GRANT USE CATALOG ON CATALOG flood_monitoring TO `data_scientists`;
-GRANT USE SCHEMA, SELECT ON SCHEMA flood_monitoring.silver TO `data_scientists`;
-GRANT USE SCHEMA, SELECT ON SCHEMA flood_monitoring.gold TO `data_scientists`;
-GRANT USE SCHEMA, CREATE TABLE, SELECT, MODIFY ON SCHEMA flood_monitoring.sandbox TO `data_scientists`;
+-- GRANT USE CATALOG ON CATALOG flood_monitoring TO `data_scientists`;
+-- GRANT USE SCHEMA, SELECT ON SCHEMA flood_monitoring.silver TO `data_scientists`;
+-- GRANT USE SCHEMA, SELECT ON SCHEMA flood_monitoring.gold TO `data_scientists`;
+-- GRANT USE SCHEMA, CREATE TABLE, SELECT, MODIFY ON SCHEMA flood_monitoring.sandbox TO `data_scientists`;
+
+-- Free Edition has a single user, who already owns the catalog, so nothing is
+-- lost by skipping these locally.
 
 -- COMMAND ----------
 

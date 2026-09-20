@@ -160,8 +160,11 @@ targets:
     variables:
       catalog: flood_monitoring
       schedule_status: UNPAUSED
-    permissions:
-      - level: CAN_VIEW
-        group_name: data_analysts
-      - level: CAN_MANAGE
-        group_name: data_engineers
+    # Commented out for Databricks Free Edition, which cannot create account
+    # groups: deploying with these fails because the principals do not exist.
+    # On a workspace with the groups defined, uncomment to restore job-level RBAC.
+    # permissions:
+    #   - level: CAN_VIEW
+    #     group_name: data_analysts
+    #   - level: CAN_MANAGE
+    #     group_name: data_engineers
