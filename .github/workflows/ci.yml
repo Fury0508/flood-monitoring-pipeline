@@ -1,0 +1,125 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  checks:
+    name: Lint and config checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install tools
+        run: pip install ruff pyyaml
+
+      # Config lives in pyproject.toml. No format check: the notebooks are
+      # Databricks source files and are intentionally not black-formatted.
+      - name: ruff check
+        run: ruff check .
+
+      - name: Notebooks keep their Databricks header
+        run: |
+          python - <<'PY'
+          import pathlib, sys
+
+          HEADER = "# Databricks notebook source"
+          bad = []
+          notebooks = sorted(pathlib.Path("notebooks").rglob("*.py"))
+          for nb in notebooks:
+              first = nb.read_text(encoding="utf-8").splitlines()[:1]
+              if not first or first[0].rstrip() != HEADER:
+                  bad.append((nb, first[0] if first else "<empty file>"))
+
+          if bad:
+              print("These notebooks do not start with the Databricks header:")
+              for nb, got in bad:
+                  print(f"  {nb}\n      expected: {HEADER!r}\n      found:    {got!r}")
+              sys.exit(1)
+
+          print(f"OK: all {len(notebooks)} notebooks start with {HEADER!r}")
+          PY
+
+      - name: Bundle is valid and defines dev, test and prod
+        run: |
+          python - <<'PY'
+          import pathlib, sys, yaml
+
+          path = pathlib.Path("resources/databricks.yml")
+          if not path.exists():
+              sys.exit(f"FAIL: {path} is missing")
+
+          bundle = yaml.safe_load(path.read_text(encoding="utf-8"))
+
+          jobs = (bundle.get("resources") or {}).get("jobs") or {}
+          if not jobs:
+              sys.exit("FAIL: the bundle defines no jobs under resources.jobs")
+
+          targets = bundle.get("targets") or {}
+          missing = [t for t in ("dev", "test", "prod") if t not in targets]
+          if missing:
+              sys.exit(f"FAIL: the bundle is missing target(s): {', '.join(missing)}")
+
+          print(f"OK: {path} parses, defines {len(jobs)} job(s): {', '.join(jobs)}")
+          print(f"OK: targets present: {', '.join(targets)}")
+          PY
+
+      - name: Every task points at a notebook that exists
+        run: |
+          python - <<'PY'
+          import pathlib, sys, yaml
+
+          bundle = yaml.safe_load(
+              pathlib.Path("resources/databricks.yml").read_text(encoding="utf-8")
+          )
+
+          # Basename match: the bundle paths are relative to resources/, while the
+          # notebooks are filed under notebooks/<layer>/.
+          on_disk = {p.name: p for p in pathlib.Path("notebooks").rglob("*")
+                     if p.suffix in (".py", ".sql")}
+
+          missing, checked = [], 0
+          for job_name, job in (bundle.get("resources") or {}).get("jobs", {}).items():
+              for task in job.get("tasks") or []:
+                  nb_path = (task.get("notebook_task") or {}).get("notebook_path")
+                  if not nb_path:
+                      continue
+                  checked += 1
+                  name = pathlib.PurePosixPath(nb_path).name
+                  if name not in on_disk:
+                      missing.append((job_name, task.get("task_key"), nb_path))
+
+          if missing:
+              print("These tasks reference notebooks that are not in notebooks/:")
+              for job_name, task_key, nb_path in missing:
+                  print(f"  job {job_name!r} task {task_key!r} -> {nb_path}")
+              sys.exit(1)
+
+          print(f"OK: all {checked} task notebook_path(s) resolve to a file in notebooks/")
+          PY
+
+  tests:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run pytest if there are tests
+        run: |
+          if [ -d tests ]; then
+            pip install pytest
+            pytest
+          else
+            echo "No tests/ directory in this repo yet - nothing to run."
+          fi
