@@ -105,6 +105,34 @@ jobs:
           print(f"OK: all {checked} task notebook_path(s) resolve to a file in notebooks/")
           PY
 
+      - name: Every %run points at a notebook that exists
+        run: |
+          python - <<'PY'
+          import pathlib, re, sys
+
+          # %run paths are relative to the calling notebook's own folder, so a
+          # notebook that moves between folders silently breaks its helpers.
+          pattern = re.compile(r"^#\s*MAGIC\s+%run\s+(\S+)")
+          broken, checked = [], 0
+          for nb in sorted(pathlib.Path("notebooks").rglob("*.py")):
+              for lineno, line in enumerate(nb.read_text(encoding="utf-8").splitlines(), 1):
+                  m = pattern.match(line)
+                  if not m:
+                      continue
+                  checked += 1
+                  target = (nb.parent / m.group(1)).resolve()
+                  if not target.with_suffix(".py").exists():
+                      broken.append((nb, lineno, m.group(1)))
+
+          if broken:
+              print("These %run targets do not resolve:")
+              for nb, lineno, target in broken:
+                  print(f"  {nb}:{lineno} -> {target}")
+              sys.exit(1)
+
+          print(f"OK: all {checked} %run targets resolve")
+          PY
+
   tests:
     name: Tests
     runs-on: ubuntu-latest

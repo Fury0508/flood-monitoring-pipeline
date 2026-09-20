@@ -13,7 +13,7 @@ dbutils.widgets.text("expected_api_version", "0.9", "Expected API version")
 
 # COMMAND ----------
 
-# MAGIC %run ./00_landing_common
+# MAGIC %run ../common/00_landing_common
 
 # COMMAND ----------
 

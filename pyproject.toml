@@ -18,6 +18,9 @@ ignore = [
     "F405",
     "E402",  # notebook cells declare widgets before imports on purpose
     "UP017", # datetime.UTC needs Python 3.11; timezone.utc works on every runtime
+    # zip() pairs lists that are built together and are always the same length,
+    # so the strict= argument would add noise without catching anything.
+    "B905",
 ]
 
 [tool.ruff.format]
@@ -29,4 +32,11 @@ testpaths = ["tests"]
 # Notebook markdown cells (# MAGIC lines) are prose, including wide tables that
 # read fine in the Databricks UI. Line length is not meaningful there, and the
 # notebooks are verified as-is, so they are not rewrapped.
-"notebooks/**/*.py" = ["E501"]
+"notebooks/**/*.py" = [
+    "E501",
+    # %run injects a helper notebook's namespace into its callers, so an import
+    # that looks unused here is often used by the notebook that loads it. In
+    # 00_pipeline_common, `re` is used by 00_bronze_common, which never imports
+    # it directly; removing it would break that notebook at runtime.
+    "F401",
+]
