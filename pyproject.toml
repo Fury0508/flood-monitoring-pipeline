@@ -25,3 +25,8 @@ quote-style = "double"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+[tool.ruff.lint.per-file-ignores]
+# Notebook markdown cells (# MAGIC lines) are prose, including wide tables that
+# read fine in the Databricks UI. Line length is not meaningful there, and the
+# notebooks are verified as-is, so they are not rewrapped.
+"notebooks/**/*.py" = ["E501"]
