@@ -1,0 +1,27 @@
+[project]
+name = "flood-monitoring-pipeline"
+version = "0.1.0"
+description = "Ingests Environment Agency real time flood monitoring data into a Databricks lakehouse"
+requires-python = ">=3.11"
+
+[tool.ruff]
+line-length = 140
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = [
+    # Databricks injects spark, dbutils and display into notebooks, and %run brings in
+    # helper functions, so undefined-name checks would fire on every notebook.
+    "F821",
+    # %run pulls helpers in as star-style globals rather than explicit imports.
+    "F405",
+    "E402",  # notebook cells declare widgets before imports on purpose
+    "UP017", # datetime.UTC needs Python 3.11; timezone.utc works on every runtime
+]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
