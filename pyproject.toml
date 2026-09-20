@@ -39,4 +39,8 @@ testpaths = ["tests"]
     # 00_pipeline_common, `re` is used by 00_bronze_common, which never imports
     # it directly; removing it would break that notebook at runtime.
     "F401",
+    # Import blocks sit inside notebook cells, where the surrounding blank lines
+    # are part of the cell layout rather than style. Sorting them would mean
+    # editing verified notebooks for no functional gain.
+    "I001",
 ]
