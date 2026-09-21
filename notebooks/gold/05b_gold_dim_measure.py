@@ -52,7 +52,7 @@ spark.sql(f"""
 
 # COMMAND ----------
 
-source = (spark.table(f"{CATALOG}.silver.measures")
+raw_source = (spark.table(f"{CATALOG}.silver.measures")
     .select(
         durable_key("measure_notation").alias("measure_key"),
         "measure_notation",
@@ -64,7 +64,15 @@ source = (spark.table(f"{CATALOG}.silver.measures")
     .withColumn("updated_at", F.current_timestamp())
     .withColumn("run_id", F.lit(RUN_ID)))
 
+# MERGE needs one row per measure_notation: keep the one that reported most recently.
+source, duplicates_resolved = one_row_per_key(
+    raw_source,
+    ["measure_notation"],
+    [F.col("latest_reading_ts").desc_nulls_last(), F.col("station_reference").isNull(), F.col("label")],
+)
+
 source.createOrReplaceTempView("src_measure")
+print(f"{source.count():,} measures ({duplicates_resolved:,} duplicate notations resolved)")
 
 # COMMAND ----------
 
@@ -87,6 +95,7 @@ try:
     rows_out = spark.table(TABLE).count()
     details = {
         "rows_in": rows_in,
+        "duplicates_resolved": duplicates_resolved,
         "rows_before": before,
         "rows_after": rows_out,
         "new_measures": rows_out - before,

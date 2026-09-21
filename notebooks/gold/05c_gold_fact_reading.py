@@ -62,10 +62,17 @@ spark.sql(f"""
 # COMMAND ----------
 
 readings = spark.table(f"{CATALOG}.silver.readings").filter(F.col("reading_date").isin(dates))
-measures = spark.table(f"{CATALOG}.silver.measures").select(
-    "measure_notation", "station_reference")
 
-source = (readings.join(F.broadcast(measures), "measure_notation", "left")
+# One station per measure, chosen the same way as dim_measure. Without this, a duplicated
+# measure would duplicate every one of its readings in the join.
+measures, _ = one_row_per_key(
+    spark.table(f"{CATALOG}.silver.measures"),
+    ["measure_notation"],
+    [F.col("latest_reading_ts").desc_nulls_last(), F.col("station_reference").isNull(), F.col("label")],
+)
+measures = measures.select("measure_notation", "station_reference")
+
+joined = (readings.join(F.broadcast(measures), "measure_notation", "left")
     .select(
         durable_key("measure_notation").alias("measure_key"),
         durable_key("station_reference").alias("station_key"),
@@ -79,7 +86,12 @@ source = (readings.join(F.broadcast(measures), "measure_notation", "left")
         F.current_timestamp().alias("loaded_at"),
     ))
 
+# Belt and braces: the MERGE key is (measure, timestamp), so guarantee exactly one source row per key.
+source, duplicates_resolved = one_row_per_key(
+    joined, ["measure_notation", "reading_ts"], [F.col("value_quality") != "ok", F.col("value")]
+)
 source.createOrReplaceTempView("src_reading")
+print(f"{duplicates_resolved:,} duplicate readings resolved before merging")
 
 # COMMAND ----------
 
@@ -132,6 +144,7 @@ try:
     rows_out = spark.table(TABLE).count()
     details.update({
         "rows_in": rows_in,
+        "duplicates_resolved": duplicates_resolved,
         "rows_in_scope_before": before,
         "rows_in_scope_after": after,
         "rows_inserted": after - before,
