@@ -71,16 +71,24 @@ spark.sql(f"""
 
 # COMMAND ----------
 
-source = (spark.table(f"{CATALOG}.silver.stations")
-    .select("station_reference", "label", "river_name", "catchment_name", "town", "status",
+raw_source = (spark.table(f"{CATALOG}.silver.stations")
+    .select("station_reference", "station_uri", "label", "river_name", "catchment_name", "town", "status",
             "latitude", "longitude", "easting", "northing", "date_opened", "station_types",
             "measure_count", "ingested_at")
     .withColumn("station_key", durable_key("station_reference"))
     .withColumn("attr_hash", attr_hash(TRACKED))
     .withColumnRenamed("ingested_at", "snapshot_ts"))
 
+# A few station URIs share a station_reference. MERGE needs one row per key, so keep the most complete one:
+# newest snapshot, then a known status, then coordinates present, then the URI as a stable tie-break.
+source, duplicates_resolved = one_row_per_key(
+    raw_source,
+    ["station_reference"],
+    [F.col("snapshot_ts").desc(), F.col("status").isNull(), F.col("latitude").isNull(), F.col("station_uri")],
+)
+
 source.createOrReplaceTempView("src_station")
-print(f"{source.count():,} stations in Silver")
+print(f"{source.count():,} stations in Silver ({duplicates_resolved:,} duplicate references resolved)")
 
 # COMMAND ----------
 
@@ -139,6 +147,7 @@ try:
     rows_out = spark.table(TABLE).count()
     details = {
         "rows_in": rows_in,
+        "duplicates_resolved": duplicates_resolved,
         "current_before": before,
         "current_after": after,
         "total_versions": rows_out,
