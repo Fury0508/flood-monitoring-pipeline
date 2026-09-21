@@ -8,7 +8,7 @@ into a medallion lakehouse on Unity Catalog.
 
 Three API endpoints are polled on a schedule: the station list, the measure list, and the
 day's readings. Every response is written to a landing volume exactly as received, then
-promoted through bronze and silver. Rows that fail validation go to `silver.quarantine`
+promoted through bronze and silver into a gold star schema. Rows that fail validation go to `silver.quarantine`
 with a reason rather than being dropped, so the rest of the batch still loads. Every run
 writes a row to `ops.pipeline_run_log`, whether it succeeds or fails.
 
@@ -25,7 +25,7 @@ API -> landing volume -> bronze -> silver -> gold
 | `landing` | `raw_files` volume: `stations/`, `measures/`, `readings/`, partitioned by run date | yes |
 | `bronze` | `stations`, `measures`, `readings` — landing files in Delta with ingestion metadata, no business rules | yes |
 | `silver` | `stations`, `measures`, `readings` — typed, validated, deduplicated; plus `quarantine` | yes |
-| `gold` | `dim_station`, `dim_measure`, `fact_reading` | not yet |
+| `gold` | `dim_station`, `dim_measure`, `fact_reading` — star schema with deterministic surrogate keys | yes |
 | `ops` | `pipeline_run_log`, `measure_watermark` | yes |
 | `sandbox` | free space for data scientists | yes |
 
@@ -36,13 +36,17 @@ parallel and each task retries on its own.
 
 ```mermaid
 flowchart LR
-    ls[landing_stations] --> bs[bronze_stations] --> ss[silver_stations]
-    lm[landing_measures] --> bm[bronze_measures] --> sm[silver_measures]
-    lr[landing_readings] --> br[bronze_readings] --> sr[silver_readings]
+    ls[landing_stations] --> bs[bronze_stations] --> ss[silver_stations] --> gs[gold_dim_station]
+    lm[landing_measures] --> bm[bronze_measures] --> sm[silver_measures] --> gm[gold_dim_measure]
+    lr[landing_readings] --> br[bronze_readings] --> sr[silver_readings] --> gf[gold_fact_reading]
+    gs --> gm
+    gm --> gf
 ```
 
-Gold converges the three chains into `dim_station`, `dim_measure` and `fact_reading`,
-followed by the catch-up task for silent stations. Neither is in the job yet.
+The chains run independently until gold, where they converge on purpose: `gold_dim_measure`
+waits on `gold_dim_station`, because it checks each measure against a current station, and
+`gold_fact_reading` waits on `gold_dim_measure`, because the fact table needs the measure
+keys. The catch-up task for silent stations is not in the job yet.
 
 ## Repository layout
 
@@ -53,7 +57,8 @@ notebooks/
 ├── common/                      helpers loaded with %run
 ├── landing/                     02a, 02b, 02c
 ├── bronze/                      03a, 03b, 03c
-└── silver/                      04a, 04b, 04c
+├── silver/                      04a, 04b, 04c
+└── gold/                        05a, 05b, 05c
 resources/databricks.yml         Asset Bundle: the job and its targets
 .github/workflows/ci.yml         lint and config checks
 ```
