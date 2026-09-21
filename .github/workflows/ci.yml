@@ -71,38 +71,55 @@ jobs:
           print(f"OK: targets present: {', '.join(targets)}")
           PY
 
-      - name: Every task points at a notebook that exists
+      - name: Every task points at a notebook or a job that exists
         run: |
           python - <<'PY'
-          import pathlib, sys, yaml
+          import pathlib, re, sys, yaml
 
           bundle = yaml.safe_load(
               pathlib.Path("resources/databricks.yml").read_text(encoding="utf-8")
           )
+          jobs = (bundle.get("resources") or {}).get("jobs") or {}
 
-          # Basename match: the bundle paths are relative to resources/, while the
+          # Basename match: bundle paths are relative to resources/, while the
           # notebooks are filed under notebooks/<layer>/.
-          on_disk = {p.name: p for p in pathlib.Path("notebooks").rglob("*")
+          on_disk = {p.name for p in pathlib.Path("notebooks").rglob("*")
                      if p.suffix in (".py", ".sql")}
 
-          missing, checked = [], 0
-          for job_name, job in (bundle.get("resources") or {}).get("jobs", {}).items():
-              for task in job.get("tasks") or []:
-                  nb_path = (task.get("notebook_task") or {}).get("notebook_path")
-                  if not nb_path:
-                      continue
-                  checked += 1
-                  name = pathlib.PurePosixPath(nb_path).name
-                  if name not in on_disk:
-                      missing.append((job_name, task.get("task_key"), nb_path))
+          # run_job_task references another job in this bundle as
+          # ${resources.jobs.<key>.id}; that key has to exist here.
+          job_ref = re.compile(r"\$\{resources\.jobs\.([A-Za-z0-9_-]+)\.id\}")
 
-          if missing:
-              print("These tasks reference notebooks that are not in notebooks/:")
-              for job_name, task_key, nb_path in missing:
-                  print(f"  job {job_name!r} task {task_key!r} -> {nb_path}")
+          problems, notebooks_checked, jobs_checked = [], 0, 0
+          for job_name, job in jobs.items():
+              for task in job.get("tasks") or []:
+                  key = task.get("task_key")
+                  if "notebook_task" in task:
+                      nb = task["notebook_task"].get("notebook_path")
+                      if not nb:
+                          problems.append(f"job {job_name!r} task {key!r}: notebook_task has no notebook_path")
+                          continue
+                      notebooks_checked += 1
+                      if pathlib.PurePosixPath(nb).name not in on_disk:
+                          problems.append(f"job {job_name!r} task {key!r}: no notebook named {nb}")
+                  elif "run_job_task" in task:
+                      jobs_checked += 1
+                      job_id = str(task["run_job_task"].get("job_id", ""))
+                      m = job_ref.fullmatch(job_id.strip())
+                      if not m:
+                          problems.append(f"job {job_name!r} task {key!r}: job_id {job_id!r} is not a bundle job reference")
+                      elif m.group(1) not in jobs:
+                          problems.append(f"job {job_name!r} task {key!r}: references job {m.group(1)!r}, which this bundle does not define")
+                  # Any other task type (SQL, pipeline, condition) is skipped.
+
+          if problems:
+              print("Bundle task references do not resolve:")
+              for p in problems:
+                  print(f"  {p}")
               sys.exit(1)
 
-          print(f"OK: all {checked} task notebook_path(s) resolve to a file in notebooks/")
+          print(f"OK: {notebooks_checked} notebook task(s) resolve to a file in notebooks/")
+          print(f"OK: {jobs_checked} run_job task(s) reference a job defined in this bundle")
           PY
 
       - name: Every %run points at a notebook that exists
