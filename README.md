@@ -31,22 +31,34 @@ API -> landing volume -> bronze -> silver -> gold
 
 ## Task graph
 
-Three independent chains, one per endpoint. They share no dependencies, so they run in
-parallel and each task retries on its own.
+Orchestration is one parent job per run, calling a child job per layer in sequence. Within
+a layer the three entities run in parallel.
 
 ```mermaid
 flowchart LR
-    ls[landing_stations] --> bs[bronze_stations] --> ss[silver_stations] --> gs[gold_dim_station]
-    lm[landing_measures] --> bm[bronze_measures] --> sm[silver_measures] --> gm[gold_dim_measure]
-    lr[landing_readings] --> br[bronze_readings] --> sr[silver_readings] --> gf[gold_fact_reading]
-    gs --> gm
-    gm --> gf
+    subgraph orchestrator [flood_monitoring_pipeline]
+        direction LR
+        L[landing] --> B[bronze] --> S[silver] --> G[gold]
+    end
 ```
 
-The chains run independently until gold, where they converge on purpose: `gold_dim_measure`
-waits on `gold_dim_station`, because it checks each measure against a current station, and
-`gold_fact_reading` waits on `gold_dim_measure`, because the fact table needs the measure
-keys. The catch-up task for silent stations is not in the job yet.
+Each box is a child job:
+
+| Child job | Tasks |
+|---|---|
+| `flood_landing` | `landing_stations`, `landing_measures`, `landing_readings` — parallel |
+| `flood_bronze` | `bronze_stations`, `bronze_measures`, `bronze_readings` — parallel |
+| `flood_silver` | `silver_stations`, `silver_measures`, `silver_readings` — parallel |
+| `flood_gold` | `gold_dim_station` → `gold_dim_measure` → `gold_fact_reading` |
+
+Gold is sequential because the fact table needs the measure keys, and the measure
+dimension checks each measure against a current station.
+
+The trade-off: each layer now waits for the whole previous layer to finish rather than for
+its own entity's predecessor, which costs a few minutes per run, in exchange for a clearer
+structure and the ability to run or repair one layer on its own.
+
+The catch-up task for silent stations is not in the job yet.
 
 ## Repository layout
 
@@ -59,7 +71,7 @@ notebooks/
 ├── bronze/                      03a, 03b, 03c
 ├── silver/                      04a, 04b, 04c
 └── gold/                        05a, 05b, 05c
-resources/databricks.yml         Asset Bundle: the job and its targets
+resources/databricks.yml         Asset Bundle: orchestrator, layer jobs, targets
 .github/workflows/ci.yml         lint and config checks
 ```
 
@@ -108,7 +120,7 @@ statements fail with a principal-not-found error. Both are left in place as docu
 - **Quarantine instead of dropping bad rows** — _(to fill in)_
 - **Watermark per measure** — _(to fill in)_
 - **One run at a time** — _(to fill in)_
-- **Three parallel chains rather than one linear job** — _(to fill in)_
+- **A child job per layer rather than one flat task graph** — _(to fill in)_
 
 ## How this was built
 

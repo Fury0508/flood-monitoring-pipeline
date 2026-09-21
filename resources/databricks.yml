@@ -1,12 +1,22 @@
-# Databricks Asset Bundle for the flood monitoring pipeline.
+# Databricks Asset Bundle for the EA flood monitoring pipeline.
 #
-# Only the landing layer exists so far, so this bundle covers only those tasks.
-# Bronze, silver, gold and the catch-up task are added to this same file as each
-# layer lands.
+# One orchestrator job runs one child job per layer, in order:
+#
+#   flood_monitoring_pipeline:  landing -> bronze -> silver -> gold
+#
+# Each child job runs its three entities (stations, measures, readings) in parallel and can
+# be run or repaired on its own. The schedule, alerting and run_id live on the orchestrator
+# only; child jobs receive the run_id so every stage of one run shares it in the run log.
+#
+#   databricks bundle validate
+#   databricks bundle deploy -t dev
+#   databricks bundle run flood_monitoring_pipeline -t dev
 
 bundle:
   name: flood-monitoring-pipeline
 
+# databricks.yml lives in resources/, so the notebooks sit outside the bundle root
+# and must be listed explicitly to be uploaded on deploy.
 sync:
   paths:
     - .
@@ -14,30 +24,27 @@ sync:
 
 variables:
   catalog:
-    description: Unity Catalog catalog this target writes to.
+    description: Unity Catalog the pipeline writes to
     default: flood_monitoring_dev
   alert_email:
-    description: Address notified when a job run fails.
+    description: Address notified when a run fails
     default: guptadhananjay090@gmail.com
   schedule_status:
-    description: Whether the schedule is live. PAUSED everywhere except prod.
+    description: PAUSED or UNPAUSED
     default: PAUSED
 
 resources:
   jobs:
+    # ------------------------------------------------------------------------------------
+    # Orchestrator: the only job with a schedule and alerts
+    # ------------------------------------------------------------------------------------
     flood_monitoring_pipeline:
       name: flood_monitoring_pipeline
-      description: >-
-        Ingests Environment Agency real-time flood monitoring data into the
-        landing volume. One run at a time; the three endpoints are independent
-        and run in parallel.
-
-      # Two runs covering the same days would contend for the same rows, so
-      # overlapping runs queue rather than run concurrently.
+      description: Runs the layer jobs in order, landing through gold.
+      # One run at a time: two runs merging the same days would contend for the same rows.
       max_concurrent_runs: 1
       queue:
         enabled: true
-
       parameters:
         - name: catalog
           default: ${var.catalog}
@@ -47,19 +54,68 @@ resources:
           default: "3"
         - name: run_id
           default: "{{job.run_id}}"
-
       schedule:
         quartz_cron_expression: "0 0 */3 * * ?"
         timezone_id: Europe/London
         pause_status: ${var.schedule_status}
-
       email_notifications:
         on_failure:
           - ${var.alert_email}
-
+        no_alert_for_skipped_runs: false
       tasks:
-        # No depends_on between the three: the endpoints are independent, so they
-        # run in parallel and each can be retried on its own.
+        - task_key: landing
+          run_job_task:
+            job_id: ${resources.jobs.flood_landing.id}
+            job_parameters:
+              catalog: "{{job.parameters.catalog}}"
+              mode: "{{job.parameters.mode}}"
+              lookback_days: "{{job.parameters.lookback_days}}"
+              run_id: "{{job.parameters.run_id}}"
+
+        - task_key: bronze
+          depends_on:
+            - task_key: landing
+          run_job_task:
+            job_id: ${resources.jobs.flood_bronze.id}
+            job_parameters:
+              catalog: "{{job.parameters.catalog}}"
+              run_id: "{{job.parameters.run_id}}"
+
+        - task_key: silver
+          depends_on:
+            - task_key: bronze
+          run_job_task:
+            job_id: ${resources.jobs.flood_silver.id}
+            job_parameters:
+              catalog: "{{job.parameters.catalog}}"
+              run_id: "{{job.parameters.run_id}}"
+
+        - task_key: gold
+          depends_on:
+            - task_key: silver
+          run_job_task:
+            job_id: ${resources.jobs.flood_gold.id}
+            job_parameters:
+              catalog: "{{job.parameters.catalog}}"
+              run_id: "{{job.parameters.run_id}}"
+
+    # ------------------------------------------------------------------------------------
+    # Layer jobs. Each can also run on its own: run_id then defaults to its own run id.
+    # ------------------------------------------------------------------------------------
+    flood_landing:
+      name: flood_landing
+      description: Fetches stations, measures and daily readings from the API into the landing volume.
+      max_concurrent_runs: 1
+      parameters:
+        - name: catalog
+          default: ${var.catalog}
+        - name: mode
+          default: incremental
+        - name: lookback_days
+          default: "3"
+        - name: run_id
+          default: "{{job.run_id}}"
+      tasks:
         - task_key: landing_stations
           notebook_task:
             notebook_path: ../notebooks/landing/02a_landing_stations.py
@@ -85,20 +141,24 @@ resources:
             notebook_path: ../notebooks/landing/02c_landing_readings.py
             base_parameters:
               catalog: "{{job.parameters.catalog}}"
-              run_id: "{{job.parameters.run_id}}"
               mode: "{{job.parameters.mode}}"
               lookback_days: "{{job.parameters.lookback_days}}"
+              run_id: "{{job.parameters.run_id}}"
           max_retries: 2
           min_retry_interval_millis: 300000
-          # Readings pull several days of data, so they get longer than the
-          # single-call station and measure tasks.
           timeout_seconds: 3600
 
-        # Each bronze task depends only on its own landing task, so the three
-        # chains stay independent and continue to run in parallel.
+    flood_bronze:
+      name: flood_bronze
+      description: Loads landed files into Bronze Delta tables, reconciled against landing counts.
+      max_concurrent_runs: 1
+      parameters:
+        - name: catalog
+          default: ${var.catalog}
+        - name: run_id
+          default: ""   # blank = latest successful landing run per entity
+      tasks:
         - task_key: bronze_stations
-          depends_on:
-            - task_key: landing_stations
           notebook_task:
             notebook_path: ../notebooks/bronze/03a_bronze_stations.py
             base_parameters:
@@ -108,8 +168,6 @@ resources:
           timeout_seconds: 1800
 
         - task_key: bronze_measures
-          depends_on:
-            - task_key: landing_measures
           notebook_task:
             notebook_path: ../notebooks/bronze/03b_bronze_measures.py
             base_parameters:
@@ -119,8 +177,6 @@ resources:
           timeout_seconds: 1800
 
         - task_key: bronze_readings
-          depends_on:
-            - task_key: landing_readings
           notebook_task:
             notebook_path: ../notebooks/bronze/03c_bronze_readings.py
             base_parameters:
@@ -129,11 +185,17 @@ resources:
           max_retries: 1
           timeout_seconds: 3600
 
-        # Each silver task depends only on its own bronze task, keeping the three
-        # chains independent all the way through the pipeline.
+    flood_silver:
+      name: flood_silver
+      description: Types, validates and deduplicates Bronze data; rejected rows go to quarantine.
+      max_concurrent_runs: 1
+      parameters:
+        - name: catalog
+          default: ${var.catalog}
+        - name: run_id
+          default: ""   # blank = latest successful bronze run per entity
+      tasks:
         - task_key: silver_stations
-          depends_on:
-            - task_key: bronze_stations
           notebook_task:
             notebook_path: ../notebooks/silver/04a_silver_stations.py
             base_parameters:
@@ -143,8 +205,6 @@ resources:
           timeout_seconds: 1800
 
         - task_key: silver_measures
-          depends_on:
-            - task_key: bronze_measures
           notebook_task:
             notebook_path: ../notebooks/silver/04b_silver_measures.py
             base_parameters:
@@ -154,8 +214,6 @@ resources:
           timeout_seconds: 1800
 
         - task_key: silver_readings
-          depends_on:
-            - task_key: bronze_readings
           notebook_task:
             notebook_path: ../notebooks/silver/04c_silver_readings.py
             base_parameters:
@@ -164,11 +222,17 @@ resources:
           max_retries: 1
           timeout_seconds: 3600
 
-        # The three chains converge here: the fact table needs the measure keys,
-        # and the measure dimension checks each measure against a current station.
+    flood_gold:
+      name: flood_gold
+      description: Publishes the star schema. dim_station (SCD2), dim_measure (Type 1), fact_reading (MERGE).
+      max_concurrent_runs: 1
+      parameters:
+        - name: catalog
+          default: ${var.catalog}
+        - name: run_id
+          default: ""   # blank = latest successful silver run per entity
+      tasks:
         - task_key: gold_dim_station
-          depends_on:
-            - task_key: silver_stations
           notebook_task:
             notebook_path: ../notebooks/gold/05a_gold_dim_station.py
             base_parameters:
@@ -177,9 +241,9 @@ resources:
           max_retries: 1
           timeout_seconds: 1800
 
+        # The measure dimension checks each measure against a current station.
         - task_key: gold_dim_measure
           depends_on:
-            - task_key: silver_measures
             - task_key: gold_dim_station
           notebook_task:
             notebook_path: ../notebooks/gold/05b_gold_dim_measure.py
@@ -189,9 +253,9 @@ resources:
           max_retries: 1
           timeout_seconds: 1800
 
+        # The fact needs the measure keys.
         - task_key: gold_fact_reading
           depends_on:
-            - task_key: silver_readings
             - task_key: gold_dim_measure
           notebook_task:
             notebook_path: ../notebooks/gold/05c_gold_fact_reading.py
@@ -201,10 +265,10 @@ resources:
           max_retries: 1
           timeout_seconds: 3600
 
-# All three targets point at the same host because this is Databricks Free
-# Edition, which is a single workspace. Only dev is deployed here; test and prod
-# are defined to show the promotion path. In a real deployment each target would
-# be its own workspace, and only CI would deploy to test and prod.
+# Only dev is deployed in this exercise: Databricks Free Edition is a single workspace.
+# test and prod are defined to show the promotion path; in a real deployment each would be
+# its own workspace and only CI would deploy to them. The targets differ only in the catalog
+# written to and whether the schedule is live, so promotion is a deploy, not a code change.
 targets:
   dev:
     mode: development
