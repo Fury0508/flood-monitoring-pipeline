@@ -122,14 +122,16 @@ def ensure_quarantine_table(catalog: str) -> None:
 def write_quarantine(catalog: str, entity: str, run_id: str, rejected: DataFrame) -> int:
     """`rejected` needs the columns key_ref, reason, detail and raw_item."""
     ensure_quarantine_table(catalog)
+    # No .cache() here: serverless compute rejects persist/cache with
+    # NOT_SUPPORTED_WITH_SERVERLESS. The rejected rows are recomputed for the
+    # count and the write, which is cheap - a quarantine batch is small by
+    # definition, being only the rows that failed validation.
     out = (rejected
            .select(F.lit(entity).alias("entity"), "key_ref", "reason", "detail", "raw_item",
-                   F.lit(run_id).alias("run_id"), F.current_timestamp().alias("quarantined_at"))
-           .cache())
+                   F.lit(run_id).alias("run_id"), F.current_timestamp().alias("quarantined_at")))
     count = out.count()
     if count:
         out.write.mode("append").saveAsTable(quarantine_table(catalog))
-    out.unpersist()
     return count
 
 # COMMAND ----------

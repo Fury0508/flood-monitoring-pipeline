@@ -6,60 +6,83 @@ into a medallion lakehouse on Unity Catalog.
 
 ## What it does
 
-Three API endpoints are polled on a schedule: the station list, the measure list, and
-the day's readings. Every response is written to a landing volume exactly as received,
-then promoted through bronze, silver and gold. Rows that fail validation are quarantined
-rather than dropped, and every run writes a row to `ops.pipeline_run_log`.
+Three API endpoints are polled on a schedule: the station list, the measure list, and the
+day's readings. Every response is written to a landing volume exactly as received, then
+promoted through bronze and silver. Rows that fail validation go to `silver.quarantine`
+with a reason rather than being dropped, so the rest of the batch still loads. Every run
+writes a row to `ops.pipeline_run_log`, whether it succeeds or fails.
 
 ## Architecture
 
 ```
 API -> landing volume -> bronze -> silver -> gold
                                      |
-                                     +-> quarantine (rows that fail validation)
+                                     +-> silver.quarantine (rows that fail validation)
 ```
 
-| Schema | Holds |
-|---|---|
-| `landing` | Raw API responses in the `raw_files` volume, partitioned by run date |
-| `bronze` | Landing files loaded into Delta with ingestion metadata, no business rules |
-| `silver` | Typed, validated, deduplicated; rejected rows go to quarantine tables |
-| `gold` | `dim_station`, `dim_measure`, `fact_reading` |
-| `ops` | `pipeline_run_log`, `measure_watermark` |
-| `sandbox` | Free space for data scientists |
+| Schema | Contents | Built? |
+|---|---|---|
+| `landing` | `raw_files` volume: `stations/`, `measures/`, `readings/`, partitioned by run date | yes |
+| `bronze` | `stations`, `measures`, `readings` — landing files in Delta with ingestion metadata, no business rules | yes |
+| `silver` | `stations`, `measures`, `readings` — typed, validated, deduplicated; plus `quarantine` | yes |
+| `gold` | `dim_station`, `dim_measure`, `fact_reading` | not yet |
+| `ops` | `pipeline_run_log`, `measure_watermark` | yes |
+| `sandbox` | free space for data scientists | yes |
 
 ## Task graph
 
-Only the landing layer is orchestrated so far. The three endpoints are independent, so
-they run in parallel and retry individually.
+Three independent chains, one per endpoint. They share no dependencies, so they run in
+parallel and each task retries on its own.
 
 ```mermaid
 flowchart LR
-    landing_stations[landing_stations]
-    landing_measures[landing_measures]
-    landing_readings[landing_readings]
+    ls[landing_stations] --> bs[bronze_stations] --> ss[silver_stations]
+    lm[landing_measures] --> bm[bronze_measures] --> sm[silver_measures]
+    lr[landing_readings] --> br[bronze_readings] --> sr[silver_readings]
 ```
 
-Bronze, silver, gold and the catch-up task are added to the same job as each layer lands.
+Gold converges the three chains into `dim_station`, `dim_measure` and `fact_reading`,
+followed by the catch-up task for silent stations. Neither is in the job yet.
+
+## Repository layout
+
+```
+notebooks/
+├── 00_explore_api.py            one-off API exploration
+├── 01_setup_unity_catalog.sql   catalog, schemas, volume, ops tables
+├── common/                      helpers loaded with %run
+├── landing/                     02a, 02b, 02c
+├── bronze/                      03a, 03b, 03c
+└── silver/                      04a, 04b, 04c
+resources/databricks.yml         Asset Bundle: the job and its targets
+.github/workflows/ci.yml         lint and config checks
+```
+
+Helpers live in `common/` and are loaded as `%run ../common/<name>`. That path is relative
+to the calling notebook, so a notebook cannot be moved between folders without updating it;
+CI checks every `%run` target resolves.
 
 ## How to run
 
 1. Import the notebooks into Databricks.
-2. Run `notebooks/01_setup_unity_catalog.sql` once to create the catalog, schemas,
-   volume and ops tables.
-3. Deploy the job from `resources/`:
+2. Run `notebooks/01_setup_unity_catalog.sql` once to create the catalog, schemas, volume
+   and ops tables.
+3. Deploy and run the job:
 
    ```bash
    databricks bundle deploy -t dev
    databricks bundle run flood_monitoring_pipeline -t dev
    ```
 
+The job takes four parameters: `catalog`, `mode` (`incremental` or `backfill`),
+`lookback_days`, and `run_id`. It is scheduled every three hours, Europe/London.
+
 ## Environments
 
-Three targets are defined — `dev`, `test` and `prod` — but only `dev` is deployed,
-because this runs on Databricks Free Edition, which is a single workspace. The targets
-differ only in the catalog they write to and whether the schedule is live, so promotion
-is a deploy, not a code change.
+Three targets are defined — `dev`, `test` and `prod` — but only `dev` is deployed, because
+this runs on Databricks Free Edition, which is a single workspace. The targets differ only
+in the catalog they write to and whether the schedule is live, so promotion is a deploy,
+not a code change.
 
 | Target | Catalog | Schedule |
 |---|---|---|
@@ -70,12 +93,17 @@ is a deploy, not a code change.
 In a real deployment each target would be its own workspace, and only CI would deploy to
 `test` and `prod`.
 
+Group grants in `01_setup_unity_catalog.sql` and the job permissions on the `prod` target
+are commented out for the same reason: Free Edition cannot create account groups, so those
+statements fail with a principal-not-found error. Both are left in place as documentation.
+
 ## Design decisions
 
 - **Landing volume before bronze** — _(to fill in)_
 - **Quarantine instead of dropping bad rows** — _(to fill in)_
 - **Watermark per measure** — _(to fill in)_
 - **One run at a time** — _(to fill in)_
+- **Three parallel chains rather than one linear job** — _(to fill in)_
 
 ## How this was built
 
