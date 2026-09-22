@@ -189,8 +189,7 @@ else, including every `SELECT` and SQL function, runs on real Spark.
 
 ## How this was built
 
-Implemented with AI assistance; the pipeline design, the API behaviour it relies on, and
-all notebook logic were reviewed and verified against a live workspace.
+AI (claude Code) was used throughout the development process to help accelerate delivery within the one-week timeframe. It supported activities such as testing, troubleshooting and resolving errors, reviewing implementation approaches, and improving the modularity, readability, and efficiency of the code. The overall pipeline design, technical decisions, API behaviour, and final notebook logic were reviewed and validated by me against the live workspace.
 
 ## Licence
 
