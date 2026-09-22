@@ -47,10 +47,13 @@ def state():
     run("silver/04c_silver_readings.py", run_id="run2")
     s["silver_after_rerun"] = one("SELECT count(*) FROM silver.readings")
 
-    run("catchup/06_catchup_silent_stations.py", run_id="run2-catchup")
+    # Deliberately given the daily run's id, as happened in the workspace: catch-up must still use its own.
+    s["bronze_run2_before_catchup"] = one("SELECT count(*) FROM bronze.readings WHERE run_id = 'run2'")
+    run("catchup/06_catchup_silent_stations.py", run_id="run2")
     s["catchup_landed"] = ldb.TaskValues.store["readings_landed"]
+    s["catchup_run_id"] = ldb.TaskValues.store["run_id"]
     for nb in READINGS_CHAIN:
-        run(nb, run_id="run2-catchup")
+        run(nb, run_id=s["catchup_run_id"])
     os.environ.pop("CORRECTION", None)
     return s
 
@@ -131,6 +134,12 @@ def test_silent_station_is_caught_up_through_the_same_notebooks(state):
     assert state["catchup_landed"] == 4
     assert one(f"SELECT count(*) FROM gold.fact_reading WHERE measure_notation = '{fx.M3}'") == 4
     assert one(f"SELECT count(*) FROM ops.measure_watermark WHERE measure_id = '{fx.M3}'") == 1
+
+
+def test_catchup_never_shares_the_daily_run_id(state):
+    assert state["catchup_run_id"] == "run2-catchup"
+    assert one("SELECT count(*) FROM bronze.readings WHERE run_id = 'run2-catchup'") == state["catchup_landed"]
+    assert one("SELECT count(*) FROM bronze.readings WHERE run_id = 'run2'") == state["bronze_run2_before_catchup"]
 
 
 def test_every_stage_is_in_the_run_log(state):

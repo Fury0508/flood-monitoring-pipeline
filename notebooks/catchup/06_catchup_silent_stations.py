@@ -34,7 +34,10 @@ dbutils.widgets.text("retention_days", "28", "How far back the live API keeps re
 from collections import defaultdict
 
 CATALOG = dbutils.widgets.get("catalog")
-RUN_ID = resolve_run_id(CATALOG, dbutils.widgets.get("run_id"))
+# Landing files and Bronze rows are keyed by run id, so catch-up must never share the daily run's id,
+# whatever id it is given. The id actually used is passed to the downstream tasks as a task value.
+_base_run_id = resolve_run_id(CATALOG, dbutils.widgets.get("run_id"))
+RUN_ID = _base_run_id if _base_run_id.endswith("-catchup") else f"{_base_run_id}-catchup"
 LOOKBACK_DAYS = int(dbutils.widgets.get("lookback_days"))
 MAX_MEASURES = int(dbutils.widgets.get("max_measures"))
 RETENTION_DAYS = int(dbutils.widgets.get("retention_days"))
@@ -130,6 +133,7 @@ with log_stage(CATALOG, RUN_ID, "landing_readings") as log:
 
 # The job skips Bronze, Silver and Gold when nothing was landed.
 dbutils.jobs.taskValues.set(key="readings_landed", value=log["rows_out"])
+dbutils.jobs.taskValues.set(key="run_id", value=RUN_ID)
 print(f"{log['rows_out']:,} readings landed for {len(to_fetch)} measures")
 
 # COMMAND ----------

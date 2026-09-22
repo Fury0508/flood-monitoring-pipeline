@@ -47,8 +47,9 @@ def check_bronze(log: dict, table: str, run_id: str, partition_col: str, expecte
     drift = {r[0]: r[1] for r in spark.sql(
         f"SELECT field, count(*) FROM {table} LATERAL VIEW explode(unexpected_fields) AS field "
         "WHERE run_id = :run_id GROUP BY field", args={"run_id": run_id}).collect()}
-    mismatches = {k: {"landing": v, "bronze": actual.get(k, 0)}
-                  for k, v in expected.items() if actual.get(k, 0) != v}
+    # Every partition must match, including ones landing never mentioned: extra rows mean files from another run.
+    mismatches = {k: {"landing": expected.get(k, 0), "bronze": actual.get(k, 0)}
+                  for k in sorted(set(expected) | set(actual)) if actual.get(k, 0) != expected.get(k, 0)}
 
     log["rows_in"] = sum(expected.values())
     log["rows_out"] = sum(actual.values())
