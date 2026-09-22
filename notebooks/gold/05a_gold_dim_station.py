@@ -5,39 +5,32 @@
 # MAGIC Publishes `silver.stations` as a dimension that keeps history.
 # MAGIC
 # MAGIC Station attributes do change: a station is suspended, a label is corrected, a river name is filled in.
-# MAGIC Flood analysis is historical, so we need to know what a station looked like **at the time of a reading**,
-# MAGIC not just today. That is why this dimension is Type 2 while `dim_measure` is Type 1.
+# MAGIC Flood analysis is historical, so analysts need to know what a station looked like **at the time of a
+# MAGIC reading**, not just today. That is why this dimension is Type 2 while `dim_measure` is Type 1.
 # MAGIC
 # MAGIC | Column | Meaning |
 # MAGIC |---|---|
 # MAGIC | `station_sk` | One row per version of a station |
-# MAGIC | `station_key` | Same for every version, so facts can join without following version changes |
+# MAGIC | `station_key` | The same for every version, so facts can join without following version changes |
 # MAGIC | `valid_from`, `valid_to`, `is_current` | The window in which this version was the published truth |
-# MAGIC | `attr_hash` | MD5 of the tracked attributes; a change in the hash is what opens a new version |
+# MAGIC | `attr_hash` | MD5 of the tracked attributes; a change in the hash opens a new version |
 # MAGIC
-# MAGIC Loading is two MERGEs: close the versions whose attributes changed, then insert the new versions.
 # MAGIC Rerunning with the same data changes nothing, because the hashes match.
 
 # COMMAND ----------
 
 dbutils.widgets.text("catalog", "flood_monitoring", "Catalog")
-dbutils.widgets.text("run_id", "", "Silver run id (blank = latest successful)")
+dbutils.widgets.text("run_id", "", "Run id (blank = latest successful silver run)")
 
 # COMMAND ----------
 
-# MAGIC %run ../common/00_gold_common
+# MAGIC %run ../common/00_pipeline_common
 
 # COMMAND ----------
 
 CATALOG = dbutils.widgets.get("catalog")
-RUN_ID = resolve_silver_run_id(CATALOG, dbutils.widgets.get("run_id"), "stations")
+RUN_ID = resolve_run_id(CATALOG, dbutils.widgets.get("run_id"), "silver_stations")
 TABLE = f"{CATALOG}.gold.dim_station"
-STARTED_AT = datetime.now(timezone.utc)
-
-TRACKED = ["label", "river_name", "catchment_name", "town", "status",
-           "latitude", "longitude", "easting", "northing", "station_types"]
-
-# COMMAND ----------
 
 spark.sql(f"""
     CREATE TABLE IF NOT EXISTS {TABLE} (
@@ -67,47 +60,48 @@ spark.sql(f"""
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Source
+# MAGIC ## Source: one row per station
+# MAGIC A few station URIs share a `station_reference`, and MERGE needs exactly one source row per key, so the most
+# MAGIC complete one wins: newest snapshot, then a known status, then coordinates present, then the URI as a tie-break.
 
 # COMMAND ----------
 
-raw_source = (spark.table(f"{CATALOG}.silver.stations")
-    .select("station_reference", "station_uri", "label", "river_name", "catchment_name", "town", "status",
-            "latitude", "longitude", "easting", "northing", "date_opened", "station_types",
-            "measure_count", "ingested_at")
-    .withColumn("station_key", durable_key("station_reference"))
-    .withColumn("attr_hash", attr_hash(TRACKED))
-    .withColumnRenamed("ingested_at", "snapshot_ts"))
-
-# A few station URIs share a station_reference. MERGE needs one row per key, so keep the most complete one:
-# newest snapshot, then a known status, then coordinates present, then the URI as a stable tie-break.
-source, duplicates_resolved = one_row_per_key(
-    raw_source,
-    ["station_reference"],
-    [F.col("snapshot_ts").desc(), F.col("status").isNull(), F.col("latitude").isNull(), F.col("station_uri")],
-)
-
-source.createOrReplaceTempView("src_station")
-print(f"{source.count():,} stations in Silver ({duplicates_resolved:,} duplicate references resolved)")
+spark.sql(f"""
+    CREATE OR REPLACE TEMP VIEW src_station AS
+    SELECT * FROM (
+      SELECT station_reference, label, river_name, catchment_name, town, status,
+             latitude, longitude, easting, northing, date_opened, station_types, measure_count,
+             ingested_at               AS snapshot_ts,
+             xxhash64(station_reference) AS station_key,
+             md5(concat_ws('||',
+               coalesce(cast(label          AS STRING), '~null~'),
+               coalesce(cast(river_name     AS STRING), '~null~'),
+               coalesce(cast(catchment_name AS STRING), '~null~'),
+               coalesce(cast(town           AS STRING), '~null~'),
+               coalesce(cast(status         AS STRING), '~null~'),
+               coalesce(cast(latitude       AS STRING), '~null~'),
+               coalesce(cast(longitude      AS STRING), '~null~'),
+               coalesce(cast(easting        AS STRING), '~null~'),
+               coalesce(cast(northing       AS STRING), '~null~'),
+               coalesce(cast(station_types  AS STRING), '~null~'))) AS attr_hash,
+             row_number() OVER (PARTITION BY station_reference
+                                ORDER BY ingested_at DESC, status IS NULL, latitude IS NULL, station_uri) AS rn
+      FROM {CATALOG}.silver.stations
+    )
+    WHERE rn = 1
+""")
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ## Load
-# MAGIC Step 1 closes versions whose attributes changed. Step 2 inserts the new version, and any station seen
-# MAGIC for the first time. Step 3 closes stations the API has stopped publishing.
+# MAGIC 1. Close the current version of any station whose attributes changed.
+# MAGIC 2. Insert the new version, and any station seen for the first time.
+# MAGIC 3. Close stations the API has stopped publishing; their history stays.
 
 # COMMAND ----------
 
-details = {}
-status = "FAILED"
-rows_in = source.count()
-rows_out = 0
-
-try:
-    before = spark.sql(f"SELECT count(*) AS n FROM {TABLE} WHERE is_current").first()["n"]
-
-    # 1. Close the current version of any station whose tracked attributes changed
+with log_stage(CATALOG, RUN_ID, "gold_dim_station") as log:
     spark.sql(f"""
         MERGE INTO {TABLE} t
         USING src_station s
@@ -116,8 +110,7 @@ try:
           UPDATE SET t.is_current = false, t.valid_to = s.snapshot_ts
     """)
 
-    # 2. Insert the new version (and brand new stations). Rows closed in step 1 are no longer current,
-    #    so they no longer match and fall into NOT MATCHED.
+    # Versions closed in step 1 are no longer current, so they fall into NOT MATCHED here.
     spark.sql(f"""
         MERGE INTO {TABLE} t
         USING src_station s
@@ -134,8 +127,7 @@ try:
         )
     """)
 
-    # 3. A station the API no longer publishes keeps its history but stops being current
-    retired = spark.sql(f"""
+    spark.sql(f"""
         MERGE INTO {TABLE} t
         USING (SELECT station_reference FROM src_station) s
           ON t.station_reference = s.station_reference
@@ -143,42 +135,22 @@ try:
           UPDATE SET t.is_current = false, t.valid_to = current_timestamp()
     """)
 
-    after = spark.sql(f"SELECT count(*) AS n FROM {TABLE} WHERE is_current").first()["n"]
-    rows_out = spark.table(TABLE).count()
-    details = {
-        "rows_in": rows_in,
-        "duplicates_resolved": duplicates_resolved,
-        "current_before": before,
-        "current_after": after,
-        "total_versions": rows_out,
-        "versions_closed_today": spark.sql(
-            f"SELECT count(*) AS n FROM {TABLE} WHERE valid_to >= current_date()").first()["n"],
-    }
-    status = "SUCCEEDED"
-
-except Exception as exc:
-    details["error"] = f"{type(exc).__name__}: {exc}"
-    raise
-
-finally:
-    write_run_log(CATALOG, RUN_ID, "gold_dim_station", status, STARTED_AT, rows_in, rows_out, 0, None, details)
-
-print(f"{status}: {details.get('current_after'):,} current stations, {rows_out:,} rows including history")
+    counts = spark.sql(f"""
+        SELECT (SELECT count(*) FROM src_station)                              AS rows_in,
+               (SELECT count(*) FROM {TABLE})                                  AS versions,
+               (SELECT count_if(is_current) FROM {TABLE})                      AS current_rows,
+               (SELECT count_if(valid_to >= current_date()) FROM {TABLE})      AS closed_today
+    """).first()
+    log.update(rows_in=counts.rows_in, rows_out=counts.versions)
+    log["details"].update(current_stations=counts.current_rows, versions_closed_today=counts.closed_today)
 
 # COMMAND ----------
 
-dbutils.jobs.taskValues.set(key="run_id", value=RUN_ID)
-
-display(spark.sql(
-    f"SELECT station_reference, label, status, river_name, town, latitude, longitude, "
-    f"       valid_from, valid_to, is_current "
-    f"FROM {TABLE} WHERE is_current ORDER BY station_reference LIMIT 20"
-))
+# MAGIC %md
+# MAGIC ## Verify: stations with more than one version (the Type 2 history; none on a first load)
 
 # COMMAND ----------
 
-# Any station with more than one version: this is the Type 2 history in action.
-# On a first load there will be none, which is correct.
 display(spark.sql(f"""
     SELECT station_reference, count(*) AS versions, min(valid_from) AS first_seen, max(valid_from) AS latest_version
     FROM {TABLE}

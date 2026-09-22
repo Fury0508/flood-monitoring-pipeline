@@ -2,7 +2,7 @@
 #
 # One orchestrator job runs one child job per layer, in order:
 #
-#   flood_monitoring_pipeline:  landing -> bronze -> silver -> gold
+#   flood_monitoring_pipeline:  landing -> bronze -> silver -> gold -> catchup
 #
 # Each child job runs its three entities (stations, measures, readings) in parallel and can
 # be run or repaired on its own. The schedule, alerting and run_id live on the orchestrator
@@ -98,6 +98,17 @@ resources:
             job_parameters:
               catalog: "{{job.parameters.catalog}}"
               run_id: "{{job.parameters.run_id}}"
+
+        # Its own run id, so catch-up files and bronze rows never replace the daily run's.
+        - task_key: catchup
+          depends_on:
+            - task_key: gold
+          run_job_task:
+            job_id: ${resources.jobs.flood_catchup.id}
+            job_parameters:
+              catalog: "{{job.parameters.catalog}}"
+              lookback_days: "{{job.parameters.lookback_days}}"
+              run_id: "{{job.parameters.run_id}}-catchup"
 
     # ------------------------------------------------------------------------------------
     # Layer jobs. Each can also run on its own: run_id then defaults to its own run id.
@@ -264,6 +275,74 @@ resources:
               run_id: "{{job.parameters.run_id}}"
           max_retries: 1
           timeout_seconds: 3600
+
+    # Stations that went silent past the daily window and came back. Only the detect-and-fetch step is new:
+    # the readings then go through the same bronze, silver and gold notebooks as the daily path.
+    flood_catchup:
+      name: flood_catchup
+      description: Recovers readings from stations that went silent and resumed, then loads them like any other readings.
+      max_concurrent_runs: 1
+      parameters:
+        - name: catalog
+          default: ${var.catalog}
+        - name: lookback_days
+          default: "3"
+        - name: run_id
+          default: "{{job.run_id}}"
+      tasks:
+        - task_key: catchup_landing
+          notebook_task:
+            notebook_path: ../notebooks/catchup/06_catchup_silent_stations.py
+            base_parameters:
+              catalog: "{{job.parameters.catalog}}"
+              lookback_days: "{{job.parameters.lookback_days}}"
+              run_id: "{{job.parameters.run_id}}"
+              max_measures: "200"
+          max_retries: 1
+          timeout_seconds: 3600
+
+        # Skip the rest when nothing needed catching up.
+        - task_key: has_readings
+          depends_on:
+            - task_key: catchup_landing
+          condition_task:
+            op: GREATER_THAN
+            left: "{{tasks.catchup_landing.values.readings_landed}}"
+            right: "0"
+
+        - task_key: bronze_readings
+          depends_on:
+            - task_key: has_readings
+              outcome: "true"
+          notebook_task:
+            notebook_path: ../notebooks/bronze/03c_bronze_readings.py
+            base_parameters:
+              catalog: "{{job.parameters.catalog}}"
+              run_id: "{{job.parameters.run_id}}"
+          max_retries: 1
+          timeout_seconds: 1800
+
+        - task_key: silver_readings
+          depends_on:
+            - task_key: bronze_readings
+          notebook_task:
+            notebook_path: ../notebooks/silver/04c_silver_readings.py
+            base_parameters:
+              catalog: "{{job.parameters.catalog}}"
+              run_id: "{{job.parameters.run_id}}"
+          max_retries: 1
+          timeout_seconds: 1800
+
+        - task_key: gold_fact_reading
+          depends_on:
+            - task_key: silver_readings
+          notebook_task:
+            notebook_path: ../notebooks/gold/05c_gold_fact_reading.py
+            base_parameters:
+              catalog: "{{job.parameters.catalog}}"
+              run_id: "{{job.parameters.run_id}}"
+          max_retries: 1
+          timeout_seconds: 1800
 
 # Only dev is deployed in this exercise: Databricks Free Edition is a single workspace.
 # test and prod are defined to show the promotion path; in a real deployment each would be

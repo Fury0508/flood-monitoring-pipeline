@@ -5,28 +5,24 @@
 # MAGIC Publishes `silver.measures` as the dimension every reading joins to.
 # MAGIC
 # MAGIC This one is **Type 1**: measure metadata is static reference data (a 15-minute river level gauge in metres stays
-# MAGIC exactly that), so keeping history would add joins and confusion for no analytical gain. If a unit or interval ever
-# MAGIC does change, the latest value is the right one to report against.
+# MAGIC exactly that), so keeping history would add joins and confusion for no analytical gain.
 # MAGIC
-# MAGIC `latest_reading_ts` comes straight from the API and is what later tells us a silent station has started reporting again.
+# MAGIC `latest_reading_ts` comes straight from the API and later tells us a silent station has started reporting again.
 
 # COMMAND ----------
 
 dbutils.widgets.text("catalog", "flood_monitoring", "Catalog")
-dbutils.widgets.text("run_id", "", "Silver run id (blank = latest successful)")
+dbutils.widgets.text("run_id", "", "Run id (blank = latest successful silver run)")
 
 # COMMAND ----------
 
-# MAGIC %run ../common/00_gold_common
+# MAGIC %run ../common/00_pipeline_common
 
 # COMMAND ----------
 
 CATALOG = dbutils.widgets.get("catalog")
-RUN_ID = resolve_silver_run_id(CATALOG, dbutils.widgets.get("run_id"), "measures")
+RUN_ID = resolve_run_id(CATALOG, dbutils.widgets.get("run_id"), "silver_measures")
 TABLE = f"{CATALOG}.gold.dim_measure"
-STARTED_AT = datetime.now(timezone.utc)
-
-# COMMAND ----------
 
 spark.sql(f"""
     CREATE TABLE IF NOT EXISTS {TABLE} (
@@ -52,38 +48,31 @@ spark.sql(f"""
 
 # COMMAND ----------
 
-raw_source = (spark.table(f"{CATALOG}.silver.measures")
-    .select(
-        durable_key("measure_notation").alias("measure_key"),
-        "measure_notation",
-        durable_key("station_reference").alias("station_key"),
-        "station_reference", "label", "parameter", "parameter_name", "qualifier",
-        "period_seconds", "unit", "unit_name", "value_type", "datum_type",
-        "latest_reading_ts", "latest_reading_value",
-    )
-    .withColumn("updated_at", F.current_timestamp())
-    .withColumn("run_id", F.lit(RUN_ID)))
-
-# MERGE needs one row per measure_notation: keep the one that reported most recently.
-source, duplicates_resolved = one_row_per_key(
-    raw_source,
-    ["measure_notation"],
-    [F.col("latest_reading_ts").desc_nulls_last(), F.col("station_reference").isNull(), F.col("label")],
-)
-
-source.createOrReplaceTempView("src_measure")
-print(f"{source.count():,} measures ({duplicates_resolved:,} duplicate notations resolved)")
+# MAGIC %md
+# MAGIC ## Source: one row per measure (the one that reported most recently wins)
 
 # COMMAND ----------
 
-details = {}
-status = "FAILED"
-rows_in = source.count()
-rows_out = 0
+spark.sql(f"""
+    CREATE OR REPLACE TEMP VIEW src_measure AS
+    SELECT measure_key, measure_notation, station_key, station_reference, label, parameter, parameter_name,
+           qualifier, period_seconds, unit, unit_name, value_type, datum_type,
+           latest_reading_ts, latest_reading_value, updated_at, '{RUN_ID}' AS run_id
+    FROM (
+      SELECT *,
+             xxhash64(measure_notation)  AS measure_key,
+             xxhash64(station_reference) AS station_key,
+             current_timestamp()         AS updated_at,
+             row_number() OVER (PARTITION BY measure_notation
+                                ORDER BY latest_reading_ts DESC NULLS LAST, station_reference IS NULL, label) AS rn
+      FROM {CATALOG}.silver.measures
+    )
+    WHERE rn = 1
+""")
 
-try:
-    before = spark.sql(f"SELECT count(*) AS n FROM {TABLE}").first()["n"]
+# COMMAND ----------
 
+with log_stage(CATALOG, RUN_ID, "gold_dim_measure") as log:
     spark.sql(f"""
         MERGE INTO {TABLE} t
         USING src_measure s
@@ -92,40 +81,23 @@ try:
         WHEN NOT MATCHED THEN INSERT *
     """)
 
-    rows_out = spark.table(TABLE).count()
-    details = {
-        "rows_in": rows_in,
-        "duplicates_resolved": duplicates_resolved,
-        "rows_before": before,
-        "rows_after": rows_out,
-        "new_measures": rows_out - before,
-        "orphans": spark.sql(f"""
-            SELECT count(*) AS n FROM {TABLE} m
-            LEFT JOIN {CATALOG}.gold.dim_station d
-              ON m.station_key = d.station_key AND d.is_current
-            WHERE d.station_key IS NULL
-        """).first()["n"],
-    }
-    status = "SUCCEEDED"
-
-except Exception as exc:
-    details["error"] = f"{type(exc).__name__}: {exc}"
-    raise
-
-finally:
-    write_run_log(CATALOG, RUN_ID, "gold_dim_measure", status, STARTED_AT, rows_in, rows_out, 0, None, details)
-
-print(f"{status}: {rows_out:,} measures ({details.get('new_measures', 0):,} new), "
-      f"{details.get('orphans', 0):,} without a matching current station")
+    counts = spark.sql(f"""
+        SELECT (SELECT count(*) FROM src_measure) AS rows_in,
+               (SELECT count(*) FROM {TABLE})     AS rows_out,
+               (SELECT count(*) FROM {TABLE} m
+                  LEFT ANTI JOIN {CATALOG}.gold.dim_station d
+                  ON m.station_key = d.station_key AND d.is_current) AS orphans
+    """).first()
+    log.update(rows_in=counts.rows_in, rows_out=counts.rows_out)
+    log["details"]["measures_without_current_station"] = counts.orphans
 
 # COMMAND ----------
 
-dbutils.jobs.taskValues.set(key="run_id", value=RUN_ID)
-
-display(spark.sql(
-    f"SELECT m.measure_notation, s.label AS station, m.parameter, m.qualifier, m.period_seconds, "
-    f"       m.unit_name, m.latest_reading_ts, m.latest_reading_value "
-    f"FROM {TABLE} m LEFT JOIN {CATALOG}.gold.dim_station s "
-    f"  ON m.station_key = s.station_key AND s.is_current "
-    f"ORDER BY m.station_reference LIMIT 20"
-))
+display(spark.sql(f"""
+    SELECT m.measure_notation, s.label AS station, m.parameter, m.qualifier, m.period_seconds,
+           m.unit_name, m.latest_reading_ts, m.latest_reading_value
+    FROM {TABLE} m
+    LEFT JOIN {CATALOG}.gold.dim_station s ON m.station_key = s.station_key AND s.is_current
+    ORDER BY m.station_reference
+    LIMIT 20
+"""))

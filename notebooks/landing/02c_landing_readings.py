@@ -28,7 +28,7 @@ dbutils.widgets.text("expected_api_version", "0.9", "Expected API version")
 from datetime import timedelta
 
 CATALOG = dbutils.widgets.get("catalog")
-RUN_ID = new_run_id(dbutils.widgets.get("run_id"))
+RUN_ID = resolve_run_id(CATALOG, dbutils.widgets.get("run_id"))
 MODE = dbutils.widgets.get("mode")
 DAYS = int(dbutils.widgets.get("backfill_days" if MODE == "backfill" else "lookback_days"))
 if DAYS < 1:
