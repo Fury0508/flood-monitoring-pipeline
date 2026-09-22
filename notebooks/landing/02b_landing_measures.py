@@ -18,7 +18,7 @@ dbutils.widgets.text("expected_api_version", "0.9", "Expected API version")
 # COMMAND ----------
 
 CATALOG = dbutils.widgets.get("catalog")
-RUN_ID = new_run_id(dbutils.widgets.get("run_id"))
+RUN_ID = resolve_run_id(CATALOG, dbutils.widgets.get("run_id"))
 RUN_DATE = datetime.now(timezone.utc).date().isoformat()
 
 calls = [{"key": "measures", "path": "/id/measures", "partition": f"run_date={RUN_DATE}", "warn_if_empty": True}]

@@ -2,16 +2,18 @@
 # MAGIC %md
 # MAGIC # 03c - Bronze: readings
 # MAGIC
-# MAGIC Loads the landed daily `/data/readings?date=` responses into `bronze.readings`: one row per reading, about
-# MAGIC 490,000 per day. Every value is kept as a string, so non-numeric values arrive in Bronze untouched.
+# MAGIC Loads the landed daily readings into `bronze.readings`: one row per reading, about 490,000 per day.
+# MAGIC Values stay strings, so non-numeric values arrive untouched and Silver decides what to do with them.
 # MAGIC
-# MAGIC The table is liquid-clustered on `reading_date`, so queries and later merges for a few days skip the rest of the table.
-# MAGIC Row counts are reconciled per day against the landing run.
+# MAGIC Row counts are reconciled **per day** against the landing stage, so a partially loaded day fails the run
+# MAGIC instead of passing quietly. The table is liquid-clustered on `reading_date`.
+# MAGIC
+# MAGIC The catch-up job reuses this notebook for readings it fetched for stations that went silent.
 
 # COMMAND ----------
 
 dbutils.widgets.text("catalog", "flood_monitoring", "Catalog")
-dbutils.widgets.text("run_id", "", "Landing run id (blank = latest successful)")
+dbutils.widgets.text("run_id", "", "Run id (blank = latest successful landing run)")
 
 # COMMAND ----------
 
@@ -20,26 +22,55 @@ dbutils.widgets.text("run_id", "", "Landing run id (blank = latest successful)")
 # COMMAND ----------
 
 CATALOG = dbutils.widgets.get("catalog")
-RUN_ID = resolve_landing_run_id(CATALOG, dbutils.widgets.get("run_id"), "readings")
-LANDING = landing_details(CATALOG, RUN_ID, "readings")
+RUN_ID = resolve_run_id(CATALOG, dbutils.widgets.get("run_id"), "landing_readings")
+LANDING = stage_details(CATALOG, RUN_ID, "landing_readings")
+TABLE = f"{CATALOG}.bronze.readings"
 
-READINGS = {
-    "table": f"{CATALOG}.bronze.readings",
-    "glob": f"/Volumes/{CATALOG}/landing/raw_files/readings/reading_date=*/readings_{RUN_ID}.json",
-    "partition_col": "reading_date",
-    "cluster": True,
-    "comment": "Raw readings from the EA flood monitoring API. All values are strings; typing happens in Silver.",
-    # our column name -> API JSON key
-    "fields": {"reading_uri": "@id", "measure_uri": "measure", "date_time": "dateTime", "value": "value"},
-    # every key we know about; anything else is reported as schema drift
-    "expected": ["@id", "date", "dateTime", "measure", "value"],
-}
+EXPECTED_KEYS = ["@id", "date", "dateTime", "measure", "value"]
+expected_keys_sql = ", ".join(f"'{k}'" for k in EXPECTED_KEYS)
 
-print(f"Loading readings from landing run {RUN_ID}")
+# Items landed per day, e.g. {"2026-09-17": 487789}
+expected_per_day = {k.removeprefix("readings_"): v for k, v in LANDING["items"].items() if k.startswith("readings_")}
 
 # COMMAND ----------
 
-run_bronze("readings", READINGS, CATALOG, RUN_ID, expected_reading_counts(LANDING))
+spark.sql(f"""
+    CREATE TABLE IF NOT EXISTS {TABLE} (
+      reading_uri STRING, measure_uri STRING, date_time STRING, value STRING,
+      raw_item          STRING COMMENT 'The API item exactly as received',
+      unexpected_fields ARRAY<STRING> COMMENT 'Keys not in the expected list: schema drift',
+      reading_date      DATE,
+      api_version       STRING,
+      run_id            STRING NOT NULL,
+      source_file       STRING,
+      ingested_at       TIMESTAMP
+    ) CLUSTER BY (reading_date)
+    COMMENT 'Raw readings from the EA flood monitoring API. All values are strings; typing happens in Silver.'
+""")
+
+# COMMAND ----------
+
+read_landing(f"/Volumes/{CATALOG}/landing/raw_files/readings/reading_date=*/readings_{RUN_ID}.json")
+
+with log_stage(CATALOG, RUN_ID, "bronze_readings") as log:
+    spark.sql(f"""
+        INSERT INTO {TABLE} REPLACE WHERE run_id = '{RUN_ID}'
+        SELECT
+          get_json_object(raw_item, "$['@id']")   AS reading_uri,
+          get_json_object(raw_item, '$.measure')  AS measure_uri,
+          get_json_object(raw_item, '$.dateTime') AS date_time,
+          get_json_object(raw_item, '$.value')    AS value,
+          raw_item,
+          array_except(json_object_keys(raw_item), array({expected_keys_sql})) AS unexpected_fields,
+          to_date(regexp_extract(source_file, 'reading_date=([0-9-]+)', 1)) AS reading_date,
+          api_version,
+          '{RUN_ID}' AS run_id,
+          source_file,
+          current_timestamp() AS ingested_at
+        FROM landed
+    """)
+
+    check_bronze(log, TABLE, RUN_ID, "reading_date", expected_per_day)
 
 # COMMAND ----------
 
@@ -48,28 +79,14 @@ run_bronze("readings", READINGS, CATALOG, RUN_ID, expected_reading_counts(LANDIN
 
 # COMMAND ----------
 
-display(spark.sql(
-    f"""
-    SELECT
-      reading_date,
-      count(*)                                     AS readings,
-      count(DISTINCT measure_uri)                  AS measures_reporting,
-      count_if(value IS NULL)                      AS missing_value,
-      count_if(try_cast(value AS DOUBLE) IS NULL
-               AND value IS NOT NULL)              AS non_numeric_value
-    FROM {READINGS['table']}
-    WHERE run_id = :run_id
+display(spark.sql(f"""
+    SELECT reading_date,
+           count(*)                                                           AS readings,
+           count(DISTINCT measure_uri)                                        AS measures_reporting,
+           count_if(value IS NULL)                                            AS missing_value,
+           count_if(value IS NOT NULL AND try_cast(value AS DOUBLE) IS NULL)  AS non_numeric_value
+    FROM {TABLE}
+    WHERE run_id = '{RUN_ID}'
     GROUP BY reading_date
     ORDER BY reading_date
-    """,
-    args={"run_id": RUN_ID},
-))
-
-# COMMAND ----------
-
-# The non-numeric values Silver will need a rule for
-display(spark.sql(
-    f"SELECT reading_date, measure_uri, date_time, value FROM {READINGS['table']} "
-    f"WHERE run_id = :run_id AND try_cast(value AS DOUBLE) IS NULL AND value IS NOT NULL LIMIT 20",
-    args={"run_id": RUN_ID},
-))
+"""))

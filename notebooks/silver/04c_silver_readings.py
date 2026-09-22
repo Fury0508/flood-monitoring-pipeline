@@ -6,18 +6,18 @@
 # MAGIC
 # MAGIC | Problem | What Silver does |
 # MAGIC |---|---|
-# MAGIC | Values are strings, and about 1 in 2,500 is not a plain number | `parse_double` recovers JSON lists and pipe-joined pairs (`0.121\|0.122`), flagged in `value_quality` |
+# MAGIC | Values are strings, and some are not plain numbers | `parse_double` recovers JSON lists and pipe-joined pairs, flagged in `value_quality` |
 # MAGIC | NaN readings arrive with no value at all | Quarantined as `missing_value` |
-# MAGIC | A reading can arrive in several runs, because each run re-fetches the last few days | Deduplicated on measure and timestamp, newest copy wins |
-# MAGIC | Timestamps are ISO text | Parsed to UTC; unparseable ones are quarantined |
+# MAGIC | A reading can arrive in several runs | Deduplicated on measure and timestamp, newest copy wins |
+# MAGIC | Timestamps are ISO text | Parsed to UTC; unparseable or future ones are quarantined |
 # MAGIC
-# MAGIC **Rebuild, not append.** The days touched by this Bronze run are rebuilt from every Bronze row for those days,
+# MAGIC **Rebuild, not append.** The days this Bronze run touched are rebuilt from every Bronze row for those days,
 # MAGIC so late-arriving readings are merged in and rerunning is always safe.
 
 # COMMAND ----------
 
 dbutils.widgets.text("catalog", "flood_monitoring", "Catalog")
-dbutils.widgets.text("run_id", "", "Bronze run id (blank = latest successful)")
+dbutils.widgets.text("run_id", "", "Run id (blank = latest successful bronze run)")
 
 # COMMAND ----------
 
@@ -26,22 +26,17 @@ dbutils.widgets.text("run_id", "", "Bronze run id (blank = latest successful)")
 # COMMAND ----------
 
 CATALOG = dbutils.widgets.get("catalog")
-RUN_ID = resolve_bronze_run_id(CATALOG, dbutils.widgets.get("run_id"), "readings")
+RUN_ID = resolve_run_id(CATALOG, dbutils.widgets.get("run_id"), "bronze_readings")
 TABLE = f"{CATALOG}.silver.readings"
-BRONZE = f"{CATALOG}.bronze.readings"
-STARTED_AT = datetime.now(timezone.utc)
+ensure_quarantine_table(CATALOG)
 
-# Which days did this Bronze run bring in?
-dates = [r["reading_date"] for r in spark.sql(
-    f"SELECT DISTINCT reading_date FROM {BRONZE} WHERE run_id = :run_id ORDER BY reading_date",
-    args={"run_id": RUN_ID}).collect()]
+# Which days did this Bronze run bring in? Only those days are rebuilt.
+dates = [str(r[0]) for r in spark.sql(
+    f"SELECT DISTINCT reading_date FROM {CATALOG}.bronze.readings WHERE run_id = '{RUN_ID}' ORDER BY 1").collect()]
 if not dates:
     raise RuntimeError(f"Bronze run {RUN_ID} has no readings to process.")
-
-date_list = ", ".join(f"'{d}'" for d in dates)
+DATES_SQL = ", ".join(f"DATE'{d}'" for d in dates)
 print(f"Rebuilding {len(dates)} day(s): {dates[0]} to {dates[-1]}")
-
-# COMMAND ----------
 
 spark.sql(f"""
     CREATE TABLE IF NOT EXISTS {TABLE} (
@@ -61,120 +56,95 @@ spark.sql(f"""
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Clean
+# MAGIC ## Parse every Bronze reading for these days (from every run), keep the newest copy, and check it
 
 # COMMAND ----------
 
-# Every Bronze row for these days, from every run, so late arrivals are included.
-bronze = spark.table(BRONZE).filter(F.col("reading_date").isin(dates))
+spark.sql(f"""
+    CREATE OR REPLACE TEMP VIEW readings_checked AS
+    WITH parsed AS (
+      SELECT reading_uri, measure_uri, date_time, value, raw_item, run_id, ingested_at,
+             last_segment(measure_uri)   AS measure_notation,
+             try_to_timestamp(date_time) AS reading_ts,
+             parse_double(value)         AS value_double,
+             CASE WHEN value IS NULL          THEN 'missing'
+                  WHEN startswith(value, '[') THEN 'recovered_from_list'
+                  WHEN contains(value, '|')   THEN 'recovered_from_pair'
+                  ELSE 'ok' END          AS value_quality
+      FROM {CATALOG}.bronze.readings
+      WHERE reading_date IN ({DATES_SQL})
+    ),
+    latest AS (
+      -- The same reading arrives in every run that re-fetches its day: the newest copy wins.
+      SELECT * FROM (
+        SELECT *, row_number() OVER (PARTITION BY measure_notation, coalesce(cast(reading_ts AS STRING), date_time)
+                                     ORDER BY ingested_at DESC) AS rn
+        FROM parsed
+      )
+      WHERE rn = 1
+    )
+    SELECT *,
+           CASE WHEN nullif(measure_notation, '') IS NULL THEN 'missing_measure'
+                WHEN reading_ts IS NULL                  THEN 'invalid_timestamp'
+                WHEN value IS NULL                       THEN 'missing_value'
+                WHEN value_double IS NULL                THEN 'non_numeric_value'
+                WHEN reading_ts > current_timestamp() + INTERVAL 1 HOUR THEN 'future_timestamp'
+           END AS rejection_reason
+    FROM latest
+""")
 
-parsed = (bronze
-    .withColumn("measure_notation", notation_from_uri("measure_uri"))
-    .withColumn("reading_ts", parse_timestamp("date_time"))
-    .withColumn("value_double", parse_double("value"))
-    .withColumn("value_quality",
-                F.when(F.col("value").isNull(), F.lit("missing"))
-                 .when(F.col("value").startswith("["), F.lit("recovered_from_list"))
-                 .when(F.col("value").contains("|"), F.lit("recovered_from_pair"))
-                 .otherwise(F.lit("ok"))))
+# COMMAND ----------
 
-rejection_reason = (
-    F.when(F.col("measure_notation").isNull() | (F.trim("measure_notation") == ""), F.lit("missing_measure"))
-     .when(F.col("reading_ts").isNull(), F.lit("invalid_timestamp"))
-     .when(F.col("value").isNull(), F.lit("missing_value"))
-     .when(F.col("value_double").isNull(), F.lit("non_numeric_value"))
-     .when(F.col("reading_ts") > F.current_timestamp() + F.expr("INTERVAL 1 HOUR"), F.lit("future_timestamp"))
-)
+with log_stage(CATALOG, RUN_ID, "silver_readings") as log:
+    spark.sql(f"""
+        INSERT INTO {CATALOG}.silver.quarantine
+          REPLACE WHERE run_id = '{RUN_ID}' AND entity = 'readings'
+        SELECT 'readings', reading_uri, rejection_reason, concat_ws(' @ ', value, date_time), raw_item,
+               '{RUN_ID}', current_timestamp()
+        FROM readings_checked
+        WHERE rejection_reason IS NOT NULL
+    """)
 
-checked = parsed.withColumn("rejection_reason", rejection_reason)
+    # REPLACE WHERE swaps only the days in scope; every other day in the table is untouched.
+    spark.sql(f"""
+        INSERT INTO {TABLE} REPLACE WHERE reading_date IN ({DATES_SQL})
+        SELECT measure_notation, measure_uri, reading_ts, to_date(reading_ts) AS reading_date,
+               value_double AS value, value AS value_raw, value_quality, run_id, ingested_at
+        FROM readings_checked
+        WHERE rejection_reason IS NULL
+    """)
 
-rejected = (checked.filter(F.col("rejection_reason").isNotNull())
-            .select(F.col("reading_uri").alias("key_ref"),
-                    F.col("rejection_reason").alias("reason"),
-                    F.concat_ws(" @ ", F.col("value"), F.col("date_time")).alias("detail"),
-                    "raw_item"))
-
-# Newest copy of each reading wins, so a re-fetched day corrects itself.
-cleaned = latest_rows(
-    checked.filter(F.col("rejection_reason").isNull()),
-    ["measure_notation", "reading_ts"],
-).select(
-    "measure_notation",
-    "measure_uri",
-    "reading_ts",
-    F.to_date("reading_ts").alias("reading_date"),
-    F.col("value_double").alias("value"),
-    F.col("value").alias("value_raw"),
-    "value_quality",
-    "run_id",
-    "ingested_at",
-)
+    counts = spark.sql(f"""
+        SELECT (SELECT count(*) FROM readings_checked)                                 AS rows_in,
+               (SELECT count(*) FROM {TABLE} WHERE reading_date IN ({DATES_SQL}))     AS rows_out,
+               (SELECT count(*) FROM readings_checked WHERE rejection_reason IS NOT NULL) AS rejected
+    """).first()
+    log.update(rows_in=counts.rows_in, rows_out=counts.rows_out, rows_rejected=counts.rejected)
+    log["details"]["dates"] = dates  # gold_fact_reading merges exactly these days
+    log["details"]["value_quality"] = {r[0]: r[1] for r in spark.sql(
+        f"SELECT value_quality, count(*) FROM {TABLE} WHERE reading_date IN ({DATES_SQL}) GROUP BY 1").collect()}
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Write
+# MAGIC ## Verify
 
 # COMMAND ----------
 
-details = {"dates": [str(d) for d in dates]}
-status = "FAILED"
-rows_in = bronze.count()
-rows_out = 0
-rows_rejected = 0
-
-try:
-    rows_rejected = write_quarantine(CATALOG, "readings", RUN_ID, rejected)
-
-    # Replace only the days in scope; every other day in the table is untouched.
-    (cleaned.write.format("delta").mode("overwrite")
-        .option("replaceWhere", f"reading_date IN ({date_list})")
-        .saveAsTable(TABLE))
-
-    per_day = spark.sql(
-        f"SELECT reading_date, count(*) AS n, count(DISTINCT measure_notation) AS measures "
-        f"FROM {TABLE} WHERE reading_date IN ({date_list}) GROUP BY reading_date ORDER BY reading_date"
-    ).collect()
-    rows_out = sum(r["n"] for r in per_day)
-    details.update({
-        "rows_in": rows_in,
-        "rows_out": rows_out,
-        "rows_rejected": rows_rejected,
-        "per_day": {str(r["reading_date"]): {"readings": r["n"], "measures": r["measures"]} for r in per_day},
-        "value_quality": {
-            r["value_quality"]: r["n"] for r in spark.sql(
-                f"SELECT value_quality, count(*) AS n FROM {TABLE} WHERE reading_date IN ({date_list}) "
-                f"GROUP BY value_quality").collect()
-        },
-    })
-    status = "SUCCEEDED"
-
-except Exception as exc:
-    details["error"] = f"{type(exc).__name__}: {exc}"
-    raise
-
-finally:
-    write_run_log(CATALOG, RUN_ID, "silver_readings", status, STARTED_AT,
-                  rows_in, rows_out, rows_rejected, None, details)
-
-print(f"{status}: {rows_out:,} readings loaded, {rows_rejected:,} quarantined")
-print(details.get("value_quality"))
+display(spark.sql(f"""
+    SELECT reading_date, count(*) AS readings, count(DISTINCT measure_notation) AS measures
+    FROM {TABLE}
+    GROUP BY reading_date
+    ORDER BY reading_date
+"""))
 
 # COMMAND ----------
 
-dbutils.jobs.taskValues.set(key="run_id", value=RUN_ID)
-
-display(spark.sql(
-    f"SELECT reading_date, count(*) AS readings, count(DISTINCT measure_notation) AS measures, "
-    f"       round(avg(value), 3) AS avg_value "
-    f"FROM {TABLE} GROUP BY reading_date ORDER BY reading_date"
-))
-
-# COMMAND ----------
-
-# What ended up in quarantine, and why
-display(spark.sql(
-    f"SELECT entity, reason, count(*) AS rows FROM {quarantine_table(CATALOG)} "
-    f"WHERE run_id = :run_id GROUP BY entity, reason ORDER BY rows DESC",
-    args={"run_id": RUN_ID},
-))
+# What went to quarantine in this run, and why
+display(spark.sql(f"""
+    SELECT entity, reason, count(*) AS rows
+    FROM {CATALOG}.silver.quarantine
+    WHERE run_id = '{RUN_ID}'
+    GROUP BY entity, reason
+    ORDER BY rows DESC
+"""))

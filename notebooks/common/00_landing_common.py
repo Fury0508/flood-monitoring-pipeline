@@ -2,7 +2,7 @@
 # MAGIC %md
 # MAGIC # 00 - Shared landing helpers
 # MAGIC
-# MAGIC Not run on its own. Each landing notebook loads these functions with `%run ./00_landing_common`.
+# MAGIC Not run on its own. Each landing notebook loads these functions with `%run ../common/00_landing_common`.
 # MAGIC
 # MAGIC Every API response is checked before it is saved:
 # MAGIC - **Truncation:** if the item count reaches `meta.limit`, the run fails instead of saving partial data.
@@ -85,9 +85,9 @@ def save_raw(raw: bytes, catalog: str, entity: str, partition: str, run_id: str)
 
 # COMMAND ----------
 
-def run_landing(entity: str, calls: list[dict], catalog: str, run_id: str, expected_api_version: str) -> dict:
+def run_landing(entity: str, calls: list[dict], catalog: str, run_id: str, expected_api_version: str) -> None:
     """
-    Make each API call, save the raw response, and log the run as stage landing_<entity>.
+    Make each API call, save the raw response, and log the stage as landing_<entity>.
 
     Each call is a dict with:
       key            name used in the run log, e.g. "stations" or "readings_2026-09-17"
@@ -95,43 +95,23 @@ def run_landing(entity: str, calls: list[dict], catalog: str, run_id: str, expec
       partition      landing folder, e.g. "run_date=2026-09-18"
       warn_if_empty  True when an empty response is suspicious (a completed day of readings)
     """
-    started_at = datetime.now(timezone.utc)
-    details = {"files": {}, "items": {}, "warnings": []}
-    versions: set[str] = set()
-    rows_saved = 0
-    status = "FAILED"
+    with log_stage(catalog, run_id, f"landing_{entity}") as log:
+        files, items, warnings, versions = {}, {}, [], set()
+        log["details"] = {"files": files, "items": items, "warnings": warnings}
 
-    try:
         for call in calls:
             raw, body = fetch(call["path"], call.get("params"))
             n = len(body["items"])
             if n == 0 and call.get("warn_if_empty"):
-                details["warnings"].append(f"{call['key']}: no items returned")
-            file_path = save_raw(raw, catalog, entity, call["partition"], run_id)
-            versions.add(body.get("meta", {}).get("version"))
-            details["files"][call["key"]] = file_path
-            details["items"][call["key"]] = n
-            rows_saved += n
-            print(f"{call['key']:<22}{n:>10,} items -> {file_path}")
+                warnings.append(f"{call['key']}: no items returned")
+            files[call["key"]] = save_raw(raw, catalog, entity, call["partition"], run_id)
+            items[call["key"]] = n
+            versions.add((body.get("meta") or {}).get("version"))
+            print(f"{call['key']:<22}{n:>10,} items -> {files[call['key']]}")
             del raw, body  # free driver memory before the next call
-        status = "SUCCEEDED"
 
-    except Exception as exc:
-        details["error"] = f"{type(exc).__name__}: {exc}"
-        raise
-
-    finally:
         versions.discard(None)
-        api_version = ",".join(sorted(versions)) or None
+        log["api_version"] = ",".join(sorted(versions)) or None
+        log["rows_in"] = log["rows_out"] = sum(items.values())
         if expected_api_version and versions and versions != {expected_api_version}:
-            details["warnings"].append(f"API version changed: expected {expected_api_version}, got {api_version}")
-        write_run_log(catalog, run_id, f"landing_{entity}", status, started_at,
-                      rows_saved, rows_saved, 0, api_version, details)
-
-    print(f"\n{status}: {rows_saved:,} {entity} items landed (run_id {run_id})")
-    for warning in details["warnings"]:
-        print(f"WARNING: {warning}")
-
-    # Lets the downstream Bronze task load exactly this run. A no-op when run interactively.
-    dbutils.jobs.taskValues.set(key="run_id", value=run_id)
-    return details
+            warnings.append(f"API version changed: expected {expected_api_version}, got {log['api_version']}")
