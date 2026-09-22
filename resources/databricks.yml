@@ -318,7 +318,7 @@ resources:
             notebook_path: ../notebooks/bronze/03c_bronze_readings.py
             base_parameters:
               catalog: "{{job.parameters.catalog}}"
-              run_id: "{{job.parameters.run_id}}"
+              run_id: "{{tasks.catchup_landing.values.run_id}}"
           max_retries: 1
           timeout_seconds: 1800
 
@@ -329,7 +329,7 @@ resources:
             notebook_path: ../notebooks/silver/04c_silver_readings.py
             base_parameters:
               catalog: "{{job.parameters.catalog}}"
-              run_id: "{{job.parameters.run_id}}"
+              run_id: "{{tasks.catchup_landing.values.run_id}}"
           max_retries: 1
           timeout_seconds: 1800
 
@@ -340,7 +340,7 @@ resources:
             notebook_path: ../notebooks/gold/05c_gold_fact_reading.py
             base_parameters:
               catalog: "{{job.parameters.catalog}}"
-              run_id: "{{job.parameters.run_id}}"
+              run_id: "{{tasks.catchup_landing.values.run_id}}"
           max_retries: 1
           timeout_seconds: 1800
 
