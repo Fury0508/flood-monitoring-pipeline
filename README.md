@@ -42,17 +42,42 @@ flowchart LR
     end
 ```
 
-Each box is a child job:
+Each box is a child job. In full:
 
-| Child job | Tasks |
-|---|---|
-| `flood_landing` | `landing_stations`, `landing_measures`, `landing_readings` — parallel |
-| `flood_bronze` | `bronze_stations`, `bronze_measures`, `bronze_readings` — parallel |
-| `flood_silver` | `silver_stations`, `silver_measures`, `silver_readings` — parallel |
-| `flood_gold` | `gold_dim_station` → `gold_dim_measure` → `gold_fact_reading` |
+```mermaid
+flowchart TB
+    subgraph FL [flood_landing]
+        direction LR
+        ls[landing_stations]
+        lm[landing_measures]
+        lr[landing_readings]
+    end
 
-Gold is sequential because the fact table needs the measure keys, and the measure
-dimension checks each measure against a current station.
+    subgraph FB [flood_bronze]
+        direction LR
+        bs[bronze_stations]
+        bm[bronze_measures]
+        br[bronze_readings]
+    end
+
+    subgraph FS [flood_silver]
+        direction LR
+        ss[silver_stations]
+        sm[silver_measures]
+        sr[silver_readings]
+    end
+
+    subgraph FG [flood_gold]
+        direction LR
+        gs[gold_dim_station] --> gm[gold_dim_measure] --> gf[gold_fact_reading]
+    end
+
+    FL --> FB --> FS --> FG
+```
+
+Within landing, bronze and silver the three tasks have no dependencies on each other, so
+they run in parallel. Gold is sequential: the fact table needs the measure keys, and the
+measure dimension checks each measure against a current station.
 
 The trade-off: each layer now waits for the whole previous layer to finish rather than for
 its own entity's predecessor, which costs a few minutes per run, in exchange for a clearer
